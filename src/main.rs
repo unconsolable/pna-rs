@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use kvs::{KvStore, KvsError, Result};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -14,11 +15,29 @@ enum Commands {
     Rm { key: String },
 }
 
-fn main() {
+fn main() -> Result<()> {
+    let mut kv = KvStore::open(".")?;
+
     let cli = Cli::parse();
     match cli.command {
-        Commands::Get { .. } => unimplemented!("unimplemented"),
-        Commands::Set { .. } => unimplemented!("unimplemented"),
-        Commands::Rm { .. } => unimplemented!("unimplemented"),
+        Commands::Get { key } => {
+            match kv.get(key)? {
+                Some(value) => {
+                    println!("{value}");
+                }
+                None => {
+                    println!("Key not found");
+                }
+            }
+            Ok(())
+        }
+        Commands::Set { key, value } => kv.set(key, value),
+        Commands::Rm { key } => match kv.remove(key) {
+            Err(KvsError::KeyNotFound) => {
+                println!("Key not found");
+                Err(KvsError::KeyNotFound)
+            }
+            other => other,
+        },
     }
 }
