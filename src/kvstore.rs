@@ -2,7 +2,7 @@
  * kvstore: key-value store
 */
 
-use crate::{KvsError, Result};
+use crate::{KvsEngine, KvsError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use std::{
@@ -17,7 +17,7 @@ const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 /// key-value store, both key and value are [`String`]
 /// ```rust
-/// use kvs::{KvStore, Result};
+/// use kvs::{KvStore, Result, KvsEngine};
 /// let mut store = KvStore::open(".").unwrap();
 /// assert!(store.set("key1".to_owned(), "value1".to_owned()).is_ok());
 /// assert_eq!(store.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
@@ -45,9 +45,9 @@ enum Command {
     Remove { key: String },
 }
 
-impl KvStore {
+impl KvsEngine for KvStore {
     /// set key to value mapping
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
         let mut json = Vec::new();
         let command = Command::Set { key, value };
         serde_json::to_writer(&mut json, &command)?;
@@ -71,7 +71,7 @@ impl KvStore {
     }
 
     /// get value via key
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
         let CommandOffset { generation, offset } = match self.kv.get(&key) {
             Some(o) => *o,
             None => return Ok(None),
@@ -94,7 +94,7 @@ impl KvStore {
     }
 
     /// remove key
-    pub fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&mut self, key: String) -> Result<()> {
         if !self.kv.contains_key(&key) {
             return Err(KvsError::KeyNotFound);
         }
@@ -120,7 +120,9 @@ impl KvStore {
 
         Ok(())
     }
+}
 
+impl KvStore {
     /// open a new [`KvStore`]
     /// `path` is a directory path
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {

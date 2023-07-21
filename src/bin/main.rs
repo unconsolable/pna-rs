@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use kvs::{KvStore, KvsError, Result};
+use kvs::{KvStore, KvsEngine, KvsError, Result};
 
 #[derive(Parser)]
 #[command(version, about)]
