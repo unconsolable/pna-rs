@@ -36,6 +36,9 @@ pub enum KvsError {
     /// client error
     #[fail(display = "Client error")]
     ClientError,
+    /// rayon thread pool error
+    #[fail(display = "{}", _0)]
+    RayonThreadPool(#[cause] rayon::ThreadPoolBuildError),
 }
 
 impl From<serde_json::Error> for KvsError {
@@ -65,5 +68,11 @@ impl From<sled::Error> for KvsError {
 impl From<string::FromUtf8Error> for KvsError {
     fn from(value: string::FromUtf8Error) -> Self {
         Self::FromUtf8(value)
+    }
+}
+
+impl From<rayon::ThreadPoolBuildError> for KvsError {
+    fn from(value: rayon::ThreadPoolBuildError) -> Self {
+        Self::RayonThreadPool(value)
     }
 }

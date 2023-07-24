@@ -16,7 +16,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let mut kv = KvStore::open(".")?;
+    let kv = KvStore::open(".")?;
 
     let cli = Cli::parse();
     match cli.command {

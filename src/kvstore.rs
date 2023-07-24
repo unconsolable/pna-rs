@@ -11,6 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
@@ -24,7 +25,12 @@ const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
 /// assert!(store.remove("key1".to_owned()).is_ok());
 /// assert_eq!(store.get("key1".to_owned()).unwrap(), None);
 /// ```
+#[derive(Clone)]
 pub struct KvStore {
+    inner: Arc<Mutex<KvStoreInner>>,
+}
+
+struct KvStoreInner {
     kv: HashMap<String, CommandOffset>,
     readers: HashMap<u64, BufReader<File>>,
     writer: BufWriter<File>,
@@ -45,7 +51,35 @@ enum Command {
     Remove { key: String },
 }
 
+impl KvStore {
+    /// open a new [`KvStoreInner`]
+    /// `path` is a directory path
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let inner = KvStoreInner::open(path)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+}
+
 impl KvsEngine for KvStore {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.get(key)
+    }
+
+    fn remove(&self, key: String) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.remove(key)
+    }
+}
+
+impl KvStoreInner {
     /// set key to value mapping
     fn set(&mut self, key: String, value: String) -> Result<()> {
         let mut json = Vec::new();
@@ -120,10 +154,8 @@ impl KvsEngine for KvStore {
 
         Ok(())
     }
-}
 
-impl KvStore {
-    /// open a new [`KvStore`]
+    /// open a new [`KvStoreInner`]
     /// `path` is a directory path
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path: PathBuf = path.into();

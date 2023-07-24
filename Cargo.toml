@@ -7,10 +7,12 @@ edition = "2018"
 [dev-dependencies]
 assert_cmd = "0.11"
 criterion = "0.3"
+crossbeam-utils = "0.6.5"
 predicates = "1.0.0"
 rand = "0.6.5"
 tempfile = "3.0.7"
 walkdir = "2.2.7"
+panic-control = "0.1.4"
 
 [dependencies]
 clap = { version = "4.3.11", features = ["derive"] }
@@ -20,6 +22,9 @@ serde_json = "1.0"
 log = "0.4"
 stderrlog = "0.5.4"
 sled = "0.34.7"
+crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
+num_cpus = "1.16.0"
+rayon = "1.7.0"
 
 [[bench]]
 name = "benches"

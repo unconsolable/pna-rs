@@ -7,7 +7,10 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use kvs::{KvStore, KvsEngine, KvsError, Request, Response, Result, SledKvsEngine};
+use kvs::{
+    thread_pool::{SharedQueueThreadPool, ThreadPool},
+    KvStore, KvsEngine, KvsError, Request, Response, Result, SledKvsEngine,
+};
 use serde_json::Deserializer;
 
 #[derive(Parser)]
@@ -70,29 +73,36 @@ fn main() -> Result<()> {
     }
 
     let listener = TcpListener::bind(cli.addr)?;
+    let thread_pool = SharedQueueThreadPool::new(num_cpus::get() as u32)?;
     match cli.engine {
-        Engine::Kvs => run_engine(listener, KvStore::open(current_dir()?)?),
+        Engine::Kvs => run_engine(listener, KvStore::open(current_dir()?)?, thread_pool),
         Engine::Sled => run_engine(
             listener,
             SledKvsEngine {
                 db: sled::open(current_dir()?)?,
             },
+            thread_pool,
         ),
     }
 }
 
-fn run_engine(listener: TcpListener, mut kv: impl KvsEngine) -> Result<()> {
+fn run_engine(
+    listener: TcpListener,
+    kv: impl KvsEngine,
+    thread_pool: impl ThreadPool,
+) -> Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         log::debug!("receive a connection {}", stream.peer_addr()?);
 
-        process(stream, &mut kv)?;
+        let kv = kv.clone();
+        thread_pool.spawn(move || process(stream, &kv).unwrap());
     }
 
     Ok(())
 }
 
-fn process(stream: TcpStream, kv: &mut impl KvsEngine) -> Result<()> {
+fn process(stream: TcpStream, kv: &impl KvsEngine) -> Result<()> {
     let reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 

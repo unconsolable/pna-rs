@@ -24,8 +24,8 @@ pub fn bench(c: &mut Criterion) {
 
     let (kvs_dir, sled_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
 
-    let mut kvs = KvStore::open(kvs_dir.path()).unwrap();
-    let mut sled = SledKvsEngine {
+    let kvs = KvStore::open(kvs_dir.path()).unwrap();
+    let sled = SledKvsEngine {
         db: sled::open(sled_dir.path()).unwrap(),
     };
 

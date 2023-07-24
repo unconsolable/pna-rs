@@ -5,11 +5,11 @@
 use crate::Result;
 
 /// kv engine trait
-pub trait KvsEngine {
+pub trait KvsEngine: Clone + Send + 'static {
     /// set a key-value pair
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
     /// get value for a key
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
     /// remove a key
-    fn remove(&mut self, key: String) -> Result<()>;
+    fn remove(&self, key: String) -> Result<()>;
 }

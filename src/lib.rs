@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 pub mod engine;
 pub use engine::KvsEngine;
+pub mod thread_pool;
 
 pub mod result;
 pub use result::{KvsError, Result};
