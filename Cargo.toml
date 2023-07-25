@@ -25,6 +25,7 @@ sled = "0.34.7"
 crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
 num_cpus = "1.16.0"
 rayon = "1.7.0"
+dashmap = "5.5.0"
 
 [[bench]]
 name = "benches"

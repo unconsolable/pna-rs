@@ -3,10 +3,11 @@
 */
 
 use crate::{KvsEngine, KvsError, Result};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Seek, Write},
@@ -27,16 +28,21 @@ const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
 /// ```
 #[derive(Clone)]
 pub struct KvStore {
-    inner: Arc<Mutex<KvStoreInner>>,
+    kv: Arc<DashMap<String, CommandOffset>>,
+    reader: KvStoreReader,
+    writer: Arc<Mutex<KvStoreWriter>>,
 }
 
-struct KvStoreInner {
-    kv: HashMap<String, CommandOffset>,
-    readers: HashMap<u64, BufReader<File>>,
+#[derive(Clone)]
+struct KvStoreReader {
+    dir_path: Arc<PathBuf>,
+}
+
+struct KvStoreWriter {
     writer: BufWriter<File>,
     writer_offset: CommandOffset,
     uncompaction_size: u64,
-    dir_path: PathBuf,
+    dir_path: Arc<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,37 +57,49 @@ enum Command {
     Remove { key: String },
 }
 
-impl KvStore {
-    /// open a new [`KvStoreInner`]
-    /// `path` is a directory path
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let inner = KvStoreInner::open(path)?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+impl KvStoreReader {
+    fn new(dir_path: Arc<PathBuf>) -> Self {
+        Self { dir_path }
+    }
+
+    fn get(&self, command_offset: CommandOffset) -> Result<String> {
+        let command_path =
+            convert_command_generation_path(&self.dir_path, command_offset.generation);
+
+        let mut reader: BufReader<File> =
+            BufReader::new(File::options().read(true).open(command_path)?);
+        reader.seek(io::SeekFrom::Start(command_offset.offset))?;
+
+        let mut command_iter = Deserializer::from_reader(reader).into_iter::<Command>();
+        Ok(match command_iter.next() {
+            Some(command) => match command? {
+                Command::Set { key: _, value } => value,
+                _ => unreachable!("should not be other command kinds"),
+            },
+            None => unreachable!("should not be None"),
         })
     }
 }
 
-impl KvsEngine for KvStore {
-    fn set(&self, key: String, value: String) -> Result<()> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.set(key, value)
+impl KvStoreWriter {
+    fn new(dir_path: Arc<PathBuf>, writer_generation: u64, uncompaction_size: u64) -> Result<Self> {
+        Ok(Self {
+            writer: Self::create_command_file(&dir_path, writer_generation)?,
+            writer_offset: CommandOffset {
+                generation: writer_generation,
+                offset: 0,
+            },
+            uncompaction_size,
+            dir_path,
+        })
     }
 
-    fn get(&self, key: String) -> Result<Option<String>> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.get(key)
-    }
-
-    fn remove(&self, key: String) -> Result<()> {
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(key)
-    }
-}
-
-impl KvStoreInner {
-    /// set key to value mapping
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(
+        &mut self,
+        key: String,
+        value: String,
+        kv: &DashMap<String, CommandOffset>,
+    ) -> Result<()> {
         let mut json = Vec::new();
         let command = Command::Set { key, value };
         serde_json::to_writer(&mut json, &command)?;
@@ -93,43 +111,19 @@ impl KvStoreInner {
             Command::Set { key, .. } => key,
             _ => unreachable!(),
         };
-        self.kv.insert(key, self.writer_offset);
+        kv.insert(key, self.writer_offset);
         self.writer_offset.offset += json.len() as u64;
 
         self.uncompaction_size += json.len() as u64;
         if self.uncompaction_size >= COMPACTION_THRESHOLD {
-            self.compaction()?;
+            self.compaction(kv)?;
         }
 
         Ok(())
     }
 
-    /// get value via key
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        let CommandOffset { generation, offset } = match self.kv.get(&key) {
-            Some(o) => *o,
-            None => return Ok(None),
-        };
-
-        let reader = self
-            .readers
-            .get_mut(&generation)
-            .expect("command reader not found");
-        reader.seek(io::SeekFrom::Start(offset))?;
-
-        let mut command_iter = Deserializer::from_reader(reader).into_iter::<Command>();
-        Ok(Some(match command_iter.next() {
-            Some(command) => match command? {
-                Command::Set { key: _, value } => value,
-                _ => unreachable!("should not be other command kinds"),
-            },
-            None => unreachable!("should not be None"),
-        }))
-    }
-
-    /// remove key
-    fn remove(&mut self, key: String) -> Result<()> {
-        if !self.kv.contains_key(&key) {
+    fn remove(&mut self, key: String, kv: &DashMap<String, CommandOffset>) -> Result<()> {
+        if !kv.contains_key(&key) {
             return Err(KvsError::KeyNotFound);
         }
 
@@ -145,54 +139,19 @@ impl KvStoreInner {
             Command::Remove { key } => key,
             _ => unreachable!(),
         };
-        self.kv.remove(&key);
+        kv.remove(&key);
 
         self.uncompaction_size += json.len() as u64;
         if self.uncompaction_size >= COMPACTION_THRESHOLD {
-            self.compaction()?;
+            self.compaction(kv)?;
         }
 
         Ok(())
     }
 
-    /// open a new [`KvStoreInner`]
-    /// `path` is a directory path
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path: PathBuf = path.into();
-        fs::create_dir_all(path.as_path())?;
-
-        let mut kv = HashMap::new();
-        let mut readers = HashMap::new();
-        let mut uncompaction_size = 0;
-        let generations = Self::get_generations(path.as_path())?;
-        let writer_generation = generations.iter().max().map_or(0, |x| x + 1);
-
-        for generation in generations {
-            let reader = Self::load_command_file(
-                path.as_ref(),
-                generation,
-                &mut kv,
-                &mut uncompaction_size,
-            )?;
-            readers.insert(generation, reader);
-        }
-
-        Ok(Self {
-            kv,
-            writer: Self::create_command_file(path.as_ref(), writer_generation, &mut readers)?,
-            readers,
-            writer_offset: CommandOffset {
-                generation: writer_generation,
-                offset: 0,
-            },
-            uncompaction_size,
-            dir_path: path,
-        })
-    }
-
-    fn compaction(&mut self) -> Result<()> {
-        let mut kv = HashMap::new();
-        let mut to_delete_generations = HashSet::new();
+    fn compaction(&mut self, kv: &DashMap<String, CommandOffset>) -> Result<()> {
+        let compacted_kv: DashMap<String, CommandOffset> = DashMap::new();
+        let mut to_delete_generations: HashSet<u64> = HashSet::new();
 
         let compaction_generation = self.writer_offset.generation + 1;
         let mut compaction_offset = CommandOffset {
@@ -200,30 +159,18 @@ impl KvStoreInner {
             offset: 0,
         };
         let mut compaction_writer =
-            Self::create_command_file(&self.dir_path, compaction_generation, &mut self.readers)?;
+            Self::create_command_file(&self.dir_path, compaction_generation)?;
+        let compaction_reader = KvStoreReader::new(self.dir_path.clone());
 
-        for pair in &self.kv {
-            let CommandOffset { generation, offset } = *pair.1;
-            to_delete_generations.insert(generation);
+        for pair in kv {
+            let command_offset = *pair.value();
+            to_delete_generations.insert(command_offset.generation);
 
-            let reader = self
-                .readers
-                .get_mut(&generation)
-                .expect("command reader not found");
-            reader.seek(io::SeekFrom::Start(offset))?;
-
-            let mut command_iter = Deserializer::from_reader(reader).into_iter::<Command>();
-            let value = match command_iter.next() {
-                Some(command) => match command? {
-                    Command::Set { key: _, value } => value,
-                    _ => unreachable!("should not be other command kinds"),
-                },
-                None => unreachable!("should not be None"),
-            };
+            let value = compaction_reader.get(command_offset)?;
 
             let mut json = Vec::new();
             let command = Command::Set {
-                key: pair.0.clone(),
+                key: pair.key().clone(),
                 value,
             };
             serde_json::to_writer(&mut json, &command)?;
@@ -235,16 +182,17 @@ impl KvStoreInner {
                 _ => unreachable!(),
             };
 
-            kv.insert(key, compaction_offset);
+            compacted_kv.insert(key, compaction_offset);
             compaction_offset.offset += json.len() as u64;
         }
 
         compaction_writer.flush()?;
-        self.kv = kv;
+        compacted_kv.into_iter().for_each(|(k, v)| {
+            kv.insert(k, v);
+        });
 
         for generation in to_delete_generations {
-            self.readers.remove(&generation);
-            fs::remove_file(Self::convert_command_generation_path(
+            fs::remove_file(convert_command_generation_path(
                 self.dir_path.as_path(),
                 generation,
             ))?;
@@ -254,40 +202,66 @@ impl KvStoreInner {
             generation: compaction_generation + 1,
             offset: 0,
         };
-        let writer =
-            Self::create_command_file(&self.dir_path, writer_offset.generation, &mut self.readers)?;
+        let writer = Self::create_command_file(&self.dir_path, writer_offset.generation)?;
 
         (self.writer, self.writer_offset, self.uncompaction_size) = (writer, writer_offset, 0);
         Ok(())
     }
 
-    fn get_generations(dir_path: &Path) -> Result<Vec<u64>> {
-        let mut result: Vec<u64> = fs::read_dir(dir_path)?
-            .flat_map(|res| -> Result<_> { Ok(res?.path()) })
-            .filter(|path| path.is_file() && path.extension() == Some(OsStr::new("json")))
-            .flat_map(|path| {
-                path.file_name()
-                    .and_then(OsStr::to_str)
-                    .map(|s| s.trim_end_matches(".json"))
-                    .map(str::parse::<u64>)
-            })
-            .flatten()
-            .collect();
+    fn create_command_file(dir_path: &Path, generation: u64) -> Result<BufWriter<File>> {
+        let path = convert_command_generation_path(dir_path, generation);
+        let writer = BufWriter::new(
+            File::options()
+                .create(true)
+                .append(true)
+                .open(path.as_path())?,
+        );
 
-        result.sort_unstable();
-        Ok(result)
+        Ok(writer)
+    }
+}
+
+fn convert_command_generation_path(dir_path: &Path, generation: u64) -> PathBuf {
+    dir_path.join(format!("{generation}.json"))
+}
+
+impl KvStore {
+    /// open a new [`KvStoreInner`]
+    /// `path` is a directory path
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path: Arc<PathBuf> = Arc::new(path.into());
+        fs::create_dir_all(path.as_path())?;
+
+        let kv = Arc::new(DashMap::new());
+        let mut uncompaction_size = 0;
+        let generations = Self::get_generations(path.as_path())?;
+        let writer_generation = generations.iter().max().map_or(0, |x| x + 1);
+
+        for generation in generations {
+            Self::load_command_file(&path, generation, &kv, &mut uncompaction_size)?
+        }
+
+        Ok(Self {
+            kv,
+            reader: KvStoreReader::new(path.clone()),
+            writer: Arc::new(Mutex::new(KvStoreWriter::new(
+                path,
+                writer_generation,
+                uncompaction_size,
+            )?)),
+        })
     }
 
     fn load_command_file(
         dir_path: &Path,
         generation: u64,
-        kv: &mut HashMap<String, CommandOffset>,
+        kv: &DashMap<String, CommandOffset>,
         uncompaction_size: &mut u64,
-    ) -> Result<BufReader<File>> {
+    ) -> Result<()> {
         let mut reader: BufReader<File> = BufReader::new(
             File::options()
                 .read(true)
-                .open(Self::convert_command_generation_path(dir_path, generation))?,
+                .open(convert_command_generation_path(dir_path, generation))?,
         );
         reader.seek(io::SeekFrom::Start(0))?;
 
@@ -307,29 +281,43 @@ impl KvStoreInner {
         }
         *uncompaction_size += offset;
 
-        Ok(reader)
+        Ok(())
     }
 
-    fn create_command_file(
-        dir_path: &Path,
-        generation: u64,
-        readers: &mut HashMap<u64, BufReader<File>>,
-    ) -> Result<BufWriter<File>> {
-        let path = Self::convert_command_generation_path(dir_path, generation);
-        let writer = BufWriter::new(
-            File::options()
-                .create(true)
-                .append(true)
-                .open(path.as_path())?,
-        );
+    fn get_generations(dir_path: &Path) -> Result<Vec<u64>> {
+        let mut result: Vec<u64> = fs::read_dir(dir_path)?
+            .flat_map(|res| -> Result<_> { Ok(res?.path()) })
+            .filter(|path| path.is_file() && path.extension() == Some(OsStr::new("json")))
+            .flat_map(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .map(|s| s.trim_end_matches(".json"))
+                    .map(str::parse::<u64>)
+            })
+            .flatten()
+            .collect();
 
-        let reader = BufReader::new(File::options().read(true).open(path.as_path())?);
-        readers.insert(generation, reader);
+        result.sort_unstable();
+        Ok(result)
+    }
+}
 
-        Ok(writer)
+impl KvsEngine for KvStore {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.set(key, value, &self.kv)
     }
 
-    fn convert_command_generation_path(dir_path: &Path, generation: u64) -> PathBuf {
-        dir_path.join(format!("{generation}.json"))
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let command_offset = match self.kv.get(&key) {
+            Some(o) => *o,
+            None => return Ok(None),
+        };
+        Ok(Some(self.reader.get(command_offset)?))
+    }
+
+    fn remove(&self, key: String) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.remove(key, &self.kv)
     }
 }
