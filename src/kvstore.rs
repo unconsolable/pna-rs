@@ -3,7 +3,7 @@
 */
 
 use crate::{KvsEngine, KvsError, Result};
-use dashmap::DashMap;
+use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use std::{
@@ -28,7 +28,7 @@ const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
 /// ```
 #[derive(Clone)]
 pub struct KvStore {
-    kv: Arc<DashMap<String, CommandOffset>>,
+    kv: Arc<SkipMap<String, CommandOffset>>,
     reader: KvStoreReader,
     writer: Arc<Mutex<KvStoreWriter>>,
 }
@@ -39,6 +39,7 @@ struct KvStoreReader {
 }
 
 struct KvStoreWriter {
+    kv: Arc<SkipMap<String, CommandOffset>>,
     writer: BufWriter<File>,
     writer_offset: CommandOffset,
     uncompaction_size: u64,
@@ -82,8 +83,14 @@ impl KvStoreReader {
 }
 
 impl KvStoreWriter {
-    fn new(dir_path: Arc<PathBuf>, writer_generation: u64, uncompaction_size: u64) -> Result<Self> {
+    fn new(
+        kv: Arc<SkipMap<String, CommandOffset>>,
+        dir_path: Arc<PathBuf>,
+        writer_generation: u64,
+        uncompaction_size: u64,
+    ) -> Result<Self> {
         Ok(Self {
+            kv,
             writer: Self::create_command_file(&dir_path, writer_generation)?,
             writer_offset: CommandOffset {
                 generation: writer_generation,
@@ -94,12 +101,7 @@ impl KvStoreWriter {
         })
     }
 
-    fn set(
-        &mut self,
-        key: String,
-        value: String,
-        kv: &DashMap<String, CommandOffset>,
-    ) -> Result<()> {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
         let mut json = Vec::new();
         let command = Command::Set { key, value };
         serde_json::to_writer(&mut json, &command)?;
@@ -111,19 +113,19 @@ impl KvStoreWriter {
             Command::Set { key, .. } => key,
             _ => unreachable!(),
         };
-        kv.insert(key, self.writer_offset);
+        self.kv.insert(key, self.writer_offset);
         self.writer_offset.offset += json.len() as u64;
 
         self.uncompaction_size += json.len() as u64;
         if self.uncompaction_size >= COMPACTION_THRESHOLD {
-            self.compaction(kv)?;
+            self.compaction()?;
         }
 
         Ok(())
     }
 
-    fn remove(&mut self, key: String, kv: &DashMap<String, CommandOffset>) -> Result<()> {
-        if !kv.contains_key(&key) {
+    fn remove(&mut self, key: String) -> Result<()> {
+        if !self.kv.contains_key(&key) {
             return Err(KvsError::KeyNotFound);
         }
 
@@ -139,18 +141,17 @@ impl KvStoreWriter {
             Command::Remove { key } => key,
             _ => unreachable!(),
         };
-        kv.remove(&key);
+        self.kv.remove(&key);
 
         self.uncompaction_size += json.len() as u64;
         if self.uncompaction_size >= COMPACTION_THRESHOLD {
-            self.compaction(kv)?;
+            self.compaction()?;
         }
 
         Ok(())
     }
 
-    fn compaction(&mut self, kv: &DashMap<String, CommandOffset>) -> Result<()> {
-        let compacted_kv: DashMap<String, CommandOffset> = DashMap::new();
+    fn compaction(&mut self) -> Result<()> {
         let mut to_delete_generations: HashSet<u64> = HashSet::new();
 
         let compaction_generation = self.writer_offset.generation + 1;
@@ -162,7 +163,7 @@ impl KvStoreWriter {
             Self::create_command_file(&self.dir_path, compaction_generation)?;
         let compaction_reader = KvStoreReader::new(self.dir_path.clone());
 
-        for pair in kv {
+        for pair in self.kv.iter() {
             let command_offset = *pair.value();
             to_delete_generations.insert(command_offset.generation);
 
@@ -182,14 +183,11 @@ impl KvStoreWriter {
                 _ => unreachable!(),
             };
 
-            compacted_kv.insert(key, compaction_offset);
+            self.kv.insert(key, compaction_offset);
             compaction_offset.offset += json.len() as u64;
         }
 
         compaction_writer.flush()?;
-        compacted_kv.into_iter().for_each(|(k, v)| {
-            kv.insert(k, v);
-        });
 
         for generation in to_delete_generations {
             fs::remove_file(convert_command_generation_path(
@@ -232,7 +230,7 @@ impl KvStore {
         let path: Arc<PathBuf> = Arc::new(path.into());
         fs::create_dir_all(path.as_path())?;
 
-        let kv = Arc::new(DashMap::new());
+        let kv = Arc::new(SkipMap::new());
         let mut uncompaction_size = 0;
         let generations = Self::get_generations(path.as_path())?;
         let writer_generation = generations.iter().max().map_or(0, |x| x + 1);
@@ -242,9 +240,10 @@ impl KvStore {
         }
 
         Ok(Self {
-            kv,
+            kv: kv.clone(),
             reader: KvStoreReader::new(path.clone()),
             writer: Arc::new(Mutex::new(KvStoreWriter::new(
+                kv,
                 path,
                 writer_generation,
                 uncompaction_size,
@@ -255,7 +254,7 @@ impl KvStore {
     fn load_command_file(
         dir_path: &Path,
         generation: u64,
-        kv: &DashMap<String, CommandOffset>,
+        kv: &SkipMap<String, CommandOffset>,
         uncompaction_size: &mut u64,
     ) -> Result<()> {
         let mut reader: BufReader<File> = BufReader::new(
@@ -305,12 +304,12 @@ impl KvStore {
 impl KvsEngine for KvStore {
     fn set(&self, key: String, value: String) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
-        writer.set(key, value, &self.kv)
+        writer.set(key, value)
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
         let command_offset = match self.kv.get(&key) {
-            Some(o) => *o,
+            Some(o) => *o.value(),
             None => return Ok(None),
         };
         Ok(Some(self.reader.get(command_offset)?))
@@ -318,6 +317,6 @@ impl KvsEngine for KvStore {
 
     fn remove(&self, key: String) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
-        writer.remove(key, &self.kv)
+        writer.remove(key)
     }
 }

@@ -26,6 +26,7 @@ crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
 num_cpus = "1.16.0"
 rayon = "1.7.0"
 dashmap = "5.5.0"
+crossbeam-skiplist = "0.1.1"
 
 [[bench]]
 name = "benches"
