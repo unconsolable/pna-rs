@@ -8,4 +8,4 @@ commit beae6a4f81cd31a9738bee5650fda9104e9669c5 is a single server version.
 
 commit 34c1ea420077d84421e646d60b8d8769500c0b85 is a lock-based version.
 
-commit 34c1ea420077d84421e646d60b8d8769500c0b85 is a reader-writer spilt version (TODO: use `crossbeam-skiplist` to skip `dashmap`)
+commit ecaa1ca831f222cb7f9f993dc5e40484a58bb07a is a reader lockfree version
